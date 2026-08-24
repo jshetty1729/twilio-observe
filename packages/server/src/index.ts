@@ -1,7 +1,10 @@
 import express from 'express';
 import cors from 'cors';
+import { createServer } from 'http';
+import { WebSocketServer } from 'ws';
 import { config } from './config.js';
 import { callRoutes } from './routes/call.routes.js';
+import { handleRelayConnection } from './routes/relay.routes.js';
 import { logger } from './utils/logger.js';
 
 const app = express();
@@ -16,8 +19,24 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: Date.now() });
 });
 
-const server = app.listen(config.server.port, () => {
+// HTTP + WebSocket server
+const httpServer = createServer(app);
+
+const wss = new WebSocketServer({ server: httpServer });
+wss.on('connection', (ws, req) => {
+  const url = new URL(req.url || '', `http://${req.headers.host}`);
+  const match = url.pathname.match(/^\/ws\/relay\/(.+)$/);
+  if (match) {
+    const callSid = match[1];
+    handleRelayConnection(ws, callSid);
+  } else {
+    logger.warn(`Unknown WebSocket path: ${url.pathname}`);
+    ws.close();
+  }
+});
+
+httpServer.listen(config.server.port, () => {
   logger.info(`Twilio Observe server running on port ${config.server.port}`);
 });
 
-export { app, server };
+export { app, httpServer as server };
