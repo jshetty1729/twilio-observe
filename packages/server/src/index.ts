@@ -4,7 +4,9 @@ import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { config } from './config.js';
 import { callRoutes } from './routes/call.routes.js';
+import { tokenRoutes } from './routes/token.routes.js';
 import { handleRelayConnection } from './routes/relay.routes.js';
+import { tacService } from './services/tac.service.js';
 import { logger } from './utils/logger.js';
 
 const app = express();
@@ -13,6 +15,11 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 app.use('/api/calls', callRoutes);
+app.use('/api/token', tokenRoutes);
+
+app.get('/api/sessions', (_req, res) => {
+  res.json(tacService.getAllSessions());
+});
 
 // Health check
 app.get('/health', (_req, res) => {
