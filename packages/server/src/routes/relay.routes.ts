@@ -1,6 +1,7 @@
 import { WebSocket } from 'ws';
 import { tacService } from '../services/tac.service.js';
 import { geminiService } from '../services/gemini.service.js';
+import { csatService } from '../services/csat.service.js';
 import { logger } from '../utils/logger.js';
 import { TranscriptTurn } from '../types/index.js';
 
@@ -44,6 +45,7 @@ export function handleRelayConnection(ws: WebSocket, callSid: string) {
           if (!tacService.getSession(sessionCallSid)) {
             tacService.createSession(sessionCallSid, setup.from);
           }
+          csatService.initCall(sessionCallSid);
           logger.info(`CR session setup: ${sessionCallSid} from ${setup.from}`);
           break;
         }
@@ -85,6 +87,12 @@ export function handleRelayConnection(ws: WebSocket, callSid: string) {
             content: aiResponse,
           };
           tacService.addTranscriptTurn(sessionCallSid, aiTurn);
+
+          // Score CSAT
+          csatService.scoreCustomerMessage(sessionCallSid, prompt.voicePrompt);
+          csatService.scoreAiResponse(sessionCallSid, aiResponse);
+          const newCsat = csatService.getScore(sessionCallSid);
+          tacService.updateCsat(sessionCallSid, newCsat);
 
           ws.send(JSON.stringify({
             type: 'text',

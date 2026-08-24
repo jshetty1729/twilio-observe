@@ -5,6 +5,8 @@ import { WebSocketServer } from 'ws';
 import { config } from './config.js';
 import { callRoutes } from './routes/call.routes.js';
 import { tokenRoutes } from './routes/token.routes.js';
+import { coachRoutes } from './routes/coach.routes.js';
+import { bargeRoutes } from './routes/barge.routes.js';
 import { handleRelayConnection } from './routes/relay.routes.js';
 import { tacService } from './services/tac.service.js';
 import { logger } from './utils/logger.js';
@@ -16,6 +18,8 @@ app.use(express.urlencoded({ extended: true }));
 
 app.use('/api/calls', callRoutes);
 app.use('/api/token', tokenRoutes);
+app.use('/api/coach', coachRoutes);
+app.use('/api/barge', bargeRoutes);
 
 app.get('/api/sessions', (_req, res) => {
   res.json(tacService.getAllSessions());
