@@ -23,8 +23,12 @@ export const BargeControls: React.FC<BargeControlsProps> = ({ callSid, status })
   };
 
   const handleHandBack = async () => {
-    await api.handBack(callSid);
-    setBarging(false);
+    try {
+      await api.handBack(callSid);
+      setBarging(false);
+    } catch (error) {
+      console.error('Hand-back failed:', error);
+    }
   };
 
   return (
