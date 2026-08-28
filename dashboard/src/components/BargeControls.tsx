@@ -17,6 +17,7 @@ export const BargeControls: React.FC<BargeControlsProps> = ({ callSid, status })
   const confNameRef = useRef<string>('');
 
   const isBarged = status === 'barged';
+  const canHandBack = isBarged && !handingBack;
 
   const handleBarge = async () => {
     setBarging(true);
@@ -97,7 +98,7 @@ export const BargeControls: React.FC<BargeControlsProps> = ({ callSid, status })
       ) : (
         <Stack orientation="vertical" spacing="space30">
           <Text as="p" fontWeight="fontWeightBold" color="colorTextError">
-            {connected ? 'LIVE — You are speaking directly to the customer.' : 'Connecting to call...'}
+            {connected ? 'LIVE — You are speaking directly to the customer.' : 'Supervisor is on the call.'}
           </Text>
           {connected && (
             <Text as="p" fontSize="fontSize20" color="colorTextWeak">
@@ -108,7 +109,7 @@ export const BargeControls: React.FC<BargeControlsProps> = ({ callSid, status })
             variant="primary"
             onClick={handleHandBack}
             loading={handingBack}
-            disabled={!connected}
+            disabled={!canHandBack}
           >
             Hand Back to AI
           </Button>
