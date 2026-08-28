@@ -2,12 +2,9 @@
   "name": "twilio-observe",
   "private": true,
   "scripts": {
-    "dev": "concurrently \"pnpm run dev:server\" \"pnpm run dev:dashboard\"",
-    "dev:server": "pnpm --filter @twilio-observe/server dev",
-    "dev:dashboard": "pnpm --filter @twilio-observe/dashboard dev"
-  },
-  "devDependencies": {
-    "concurrently": "^8.2.0",
-    "typescript": "^5.5.0"
+    "dev": "make dev",
+    "dev:server": "make server",
+    "dev:dashboard": "make dashboard",
+    "test": "make test"
   }
 }
