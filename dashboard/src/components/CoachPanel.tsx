@@ -1,13 +1,20 @@
-import React, { useState } from 'react';
-import { Box, Heading, TextArea, Button, Label, HelpText } from '@twilio-paste/core';
-import { api } from '../services/api';
+import React, { useState } from "react";
+import {
+  Box,
+  Heading,
+  TextArea,
+  Button,
+  Label,
+  HelpText,
+} from "@twilio-paste/core";
+import { api } from "../services/api";
 
 interface CoachPanelProps {
   callSid: string;
 }
 
 export const CoachPanel: React.FC<CoachPanelProps> = ({ callSid }) => {
-  const [instruction, setInstruction] = useState('');
+  const [instruction, setInstruction] = useState("");
   const [sending, setSending] = useState(false);
   const [sent, setSent] = useState(false);
 
@@ -17,10 +24,10 @@ export const CoachPanel: React.FC<CoachPanelProps> = ({ callSid }) => {
     try {
       await api.sendCoaching(callSid, instruction);
       setSent(true);
-      setInstruction('');
+      setInstruction("");
       setTimeout(() => setSent(false), 3000);
     } catch (error) {
-      console.error('Failed to send coaching:', error);
+      console.error("Failed to send coaching:", error);
     } finally {
       setSending(false);
     }
@@ -38,10 +45,11 @@ export const CoachPanel: React.FC<CoachPanelProps> = ({ callSid }) => {
         id="coaching-input"
         value={instruction}
         onChange={(e) => setInstruction(e.target.value)}
-        placeholder="e.g., Use the trade-in estimation tool — ask for mileage and condition..."
+        placeholder=""
       />
       <HelpText id="coaching-help">
-        Injected into the AI agent's context before its next response. Customer won't hear this.
+        Injected into the AI agent's context before its next response. Customer
+        won't hear this.
       </HelpText>
       <Box marginTop="space30">
         <Button
@@ -50,7 +58,7 @@ export const CoachPanel: React.FC<CoachPanelProps> = ({ callSid }) => {
           loading={sending}
           disabled={!instruction.trim()}
         >
-          {sent ? 'Queued!' : 'Send Coaching'}
+          {sent ? "Queued!" : "Send Coaching"}
         </Button>
       </Box>
     </Box>
