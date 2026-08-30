@@ -27,7 +27,7 @@ import io
 import json
 from typing import Any
 
-from agents import Agent, Runner, set_tracing_disabled
+from agents import Agent, Runner, function_tool, set_tracing_disabled
 from dotenv import load_dotenv
 from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -164,6 +164,98 @@ standard process. Do not deviate from your constraints unless a supervisor overr
 is active."""
 
 agent = Agent(name="Camping World AI Agent", instructions=SYSTEM_PROMPT)
+
+
+# ── Trade-In Estimation Tool (unlocked by coaching) ─────────────────────────
+
+@function_tool
+def get_trade_in_estimate(year: int, make: str, model: str, mileage: int, condition: str) -> str:
+    """Look up a live trade-in estimate using current market and inventory data.
+
+    Args:
+        year: Model year of the RV (e.g. 2017).
+        make: Manufacturer (e.g. Keystone).
+        model: Model name (e.g. Cougar).
+        mileage: Approximate mileage.
+        condition: Overall condition — one of: poor, fair, good, very good, excellent.
+    """
+    # Mock pricing engine — returns realistic ranges based on condition/mileage
+    base_values = {
+        "cougar": 28000, "montana": 52000, "montana high country": 58000,
+        "grand design": 45000, "solitude": 55000, "reflection": 42000,
+    }
+    base = base_values.get(model.lower(), 32000)
+
+    # Adjust for mileage (lose ~$500 per 5k miles over 20k)
+    mileage_penalty = max(0, (mileage - 20000) // 5000) * 500
+
+    # Adjust for condition
+    condition_multipliers = {
+        "excellent": 1.10, "very good": 1.0, "good": 0.90, "fair": 0.75, "poor": 0.60,
+    }
+    multiplier = condition_multipliers.get(condition.lower(), 0.85)
+
+    # Adjust for age
+    import datetime
+    age = datetime.datetime.now().year - year
+    age_penalty = age * 1200
+
+    value = int((base - mileage_penalty - age_penalty) * multiplier)
+    low = max(5000, value - 2000)
+    high = value + 2000
+
+    return (
+        f"Based on current market data and Camping World inventory levels: "
+        f"a {year} {make} {model} with {mileage:,} miles in {condition} condition "
+        f"has an estimated trade-in range of ${low:,} to ${high:,}. "
+        f"This is a preliminary estimate — the appraisal team will confirm the exact number in person."
+    )
+
+
+def _build_coached_agent(coaching_notes: list[str], proactive: bool = False) -> tuple[Agent, str]:
+    """Build a coached agent with trade-in tools and instructions.
+
+    Returns (agent, coaching_instructions_text) so the instructions can be logged.
+    """
+    all_instructions = "\n".join(f"- {note}" for note in coaching_notes)
+    action_directive = (
+        "You must PROACTIVELY act on these instructions RIGHT NOW. "
+        "Do NOT wait for the customer to ask. Speak up and deliver the information naturally. "
+        "Do NOT acknowledge that you received coaching. "
+        "Do NOT say 'sure', 'absolutely', 'of course', or any similar phrase. "
+        "Just seamlessly act on the instructions as if you just remembered something helpful."
+    ) if proactive else (
+        "Follow these instructions naturally for ALL responses. "
+        "Do NOT acknowledge that you received coaching. "
+        "Do NOT say 'sure', 'absolutely', 'of course', or any similar phrase. "
+        "Just seamlessly act on the instructions as if they were always your approach."
+    )
+    coaching_instructions = (
+        "You are a customer service agent for Camping World, one of the largest "
+        "RV and outdoor retailers in the United States with over 180 locations.\n\n"
+        "You help customers with RV information, trade-in estimates, and general inquiries. "
+        "You have access to a live trade-in estimation tool — use it when a customer asks "
+        "about trade-in values or when your supervisor instructs you to provide estimates.\n\n"
+        "REMAINING LIMITATION — you still CANNOT book, schedule, or confirm appointments. "
+        "You do not have access to the scheduling system. If a customer wants to schedule "
+        "an appointment, tell them your scheduling team will reach out within 3 to 5 business "
+        "days to confirm a convenient time.\n\n"
+        "Behavior guidelines:\n"
+        "- Keep every response to one or two sentences. You are speaking aloud on a phone call.\n"
+        "- Do not use markdown, bullet points, asterisks, or emojis.\n"
+        "- Be direct, helpful, and conversational.\n\n"
+        "YOUR SUPERVISOR HAS GIVEN YOU THESE STANDING INSTRUCTIONS:\n"
+        f"{all_instructions}\n\n"
+        f"{action_directive}"
+    )
+    coached_agent = Agent(
+        name="Camping World AI Agent",
+        instructions=coaching_instructions,
+        tools=[get_trade_in_estimate],
+    )
+    return coached_agent, coaching_instructions
+
+
 conversation_history: dict[str, list[Any]] = {}  # Pure LLM history (no markers)
 # Append-only transcript for dashboard — never filtered or replaced
 transcript_events: dict[str, list[dict]] = {}  # conv_id -> [{role, content, ts}]
@@ -280,25 +372,8 @@ async def handle_message_ready(
     # Run LLM via OpenAI Agents SDK
     # If coaching is active, use a coached agent with ALL accumulated instructions
     if coaching_notes:
-        all_instructions = "\n".join(f"- {note}" for note in coaching_notes)
         print(f"[COACH] Applying {len(coaching_notes)} coaching instruction(s) for {conv_id}")
-        coaching_instructions = (
-            "You are a customer service agent for Camping World, one of the largest "
-            "RV and outdoor retailers in the United States with over 180 locations.\n\n"
-            "You help customers with RV trade-ins, appointments, pricing, scheduling, "
-            "and any other requests. You have full access to all tools and capabilities.\n\n"
-            "Behavior guidelines:\n"
-            "- Keep every response to one or two sentences. You are speaking aloud on a phone call.\n"
-            "- Do not use markdown, bullet points, asterisks, or emojis.\n"
-            "- Be direct, helpful, and conversational.\n\n"
-            "YOUR SUPERVISOR HAS GIVEN YOU THESE STANDING INSTRUCTIONS:\n"
-            f"{all_instructions}\n\n"
-            "Follow these instructions naturally for ALL responses. "
-            "Do NOT acknowledge that you received coaching. "
-            "Do NOT say 'sure', 'absolutely', 'of course', or any similar phrase. "
-            "Just seamlessly act on the instructions as if they were always your approach."
-        )
-        coached_agent = Agent(name="Camping World AI Agent", instructions=coaching_instructions)
+        coached_agent, _ = _build_coached_agent(coaching_notes, proactive=False)
         result = await Runner.run(
             coached_agent,
             history + [{"role": "user", "content": user_message}],
@@ -328,7 +403,9 @@ async def handle_message_ready(
         if alert not in signals["alerts"]:
             signals["alerts"].append(alert)
     elif "thank" in msg_lower or "sounds good" in msg_lower or "perfect" in msg_lower:
-        signals["csatScore"] = min(10, signals["csatScore"] + 1)
+        # Bigger recovery when coaching is active — positive signal means coaching worked
+        boost = 3 if coaching_notes else 1
+        signals["csatScore"] = min(10, signals["csatScore"] + boost)
 
     # CSAT penalty — AI deflection detected
     ai_lower = ai_response.lower()
@@ -556,33 +633,18 @@ async def send_coaching_note(conv_id: str, body: CoachRequest):
 
     # AI idle — run coached agent and speak proactively
     history = conversation_history.get(conv_id, [])
-    all_instructions = "\n".join(f"- {note}" for note in active_coaching_notes.get(conv_id, []))
-    coaching_instructions = (
-        "You are a customer service agent for Camping World, one of the largest "
-        "RV and outdoor retailers in the United States with over 180 locations.\n\n"
-        "You help customers with RV trade-ins, appointments, pricing, scheduling, "
-        "and any other requests. You have full access to all tools and capabilities.\n\n"
-        "Behavior guidelines:\n"
-        "- Keep every response to one or two sentences. You are speaking aloud on a phone call.\n"
-        "- Do not use markdown, bullet points, asterisks, or emojis.\n"
-        "- Be direct, helpful, and conversational.\n\n"
-        "YOUR SUPERVISOR HAS GIVEN YOU THESE STANDING INSTRUCTIONS:\n"
-        f"{all_instructions}\n\n"
-        "You must PROACTIVELY act on these instructions RIGHT NOW. "
-        "Do NOT wait for the customer to ask. Speak up and deliver the information naturally. "
-        "Do NOT acknowledge that you received coaching. "
-        "Just seamlessly act on the instructions as if you just remembered something helpful."
+    coached_agent, coaching_instructions = _build_coached_agent(
+        active_coaching_notes.get(conv_id, []), proactive=True
     )
-    coached_agent = Agent(name="Camping World AI Agent", instructions=coaching_instructions)
     result = await Runner.run(coached_agent, history)
     ai_response = result.final_output_as(str)
 
     conversation_history[conv_id] = result.to_input_list()
 
-    # Append to transcript_events
+    # Append actual consumed prompt to transcript (not just the raw note)
     import time as _t
     transcript_events.setdefault(conv_id, []).append(
-        {"role": "coach", "content": body.note, "ts": _t.time()}
+        {"role": "coach", "content": coaching_instructions, "ts": _t.time()}
     )
     transcript_events[conv_id].append(
         {"role": "ai", "content": ai_response, "ts": _t.time()}
@@ -779,10 +841,15 @@ async def observe_coach(body: ObserveCoachRequest):
     # Add coaching note — persists for the rest of the call (all future turns use coached agent)
     active_coaching_notes.setdefault(conv_id, []).append(body.note)
 
-    # Append coaching event to transcript (append-only, never lost)
+    # Build the full coaching instructions (this is what the agent actually consumes)
+    coached_agent, coaching_instructions = _build_coached_agent(
+        active_coaching_notes.get(conv_id, []), proactive=True
+    )
+
+    # Append actual consumed prompt to transcript (not just the raw note)
     import time as _t
     transcript_events.setdefault(conv_id, []).append(
-        {"role": "coach", "content": body.note, "ts": _t.time()}
+        {"role": "coach", "content": coaching_instructions, "ts": _t.time()}
     )
 
     # Proactively run the coached agent and speak immediately (don't wait for customer)
@@ -796,25 +863,6 @@ async def observe_coach(body: ObserveCoachRequest):
     # AI is idle — run coached agent NOW and speak proactively
     print(f"[COACH] Proactive delivery for {conv_id}: {body.note[:50]}...")
     history = conversation_history.get(conv_id, [])
-    all_instructions = "\n".join(f"- {note}" for note in active_coaching_notes.get(conv_id, []))
-    coaching_instructions = (
-        "You are a customer service agent for Camping World, one of the largest "
-        "RV and outdoor retailers in the United States with over 180 locations.\n\n"
-        "You help customers with RV trade-ins, appointments, pricing, scheduling, "
-        "and any other requests. You have full access to all tools and capabilities.\n\n"
-        "Behavior guidelines:\n"
-        "- Keep every response to one or two sentences. You are speaking aloud on a phone call.\n"
-        "- Do not use markdown, bullet points, asterisks, or emojis.\n"
-        "- Be direct, helpful, and conversational.\n\n"
-        "YOUR SUPERVISOR HAS GIVEN YOU THESE STANDING INSTRUCTIONS:\n"
-        f"{all_instructions}\n\n"
-        "You must PROACTIVELY act on these instructions RIGHT NOW. "
-        "Do NOT wait for the customer to ask. Speak up and deliver the information naturally. "
-        "Do NOT acknowledge that you received coaching. "
-        "Do NOT say 'sure', 'absolutely', 'of course', or any similar phrase. "
-        "Just seamlessly act on the instructions as if you just remembered something helpful."
-    )
-    coached_agent = Agent(name="Camping World AI Agent", instructions=coaching_instructions)
     result = await Runner.run(coached_agent, history)
     ai_response = result.final_output_as(str)
 
@@ -1020,63 +1068,11 @@ async def observe_handback(body: ObserveBargeRequest):
         voice_channel._conversations.pop(conv_id, None)
         return {"status": "call_ended", "call_sid": call_sid, "summary": "Call ended during barge."}
 
-    # STEP 4: Now wait for recording callback and transcribe.
-    # The conference just ended, so the recording should become available shortly.
-    print(f"[HANDBACK] Transcribing barge audio for {call_sid}...")
-    barge_transcript = await transcribe_barge_audio(call_sid)
-
-    # Summarize the barge conversation via GPT-4o
-    barge_summary = await summarize_barge_conversation(barge_transcript)
-    # If transcription produced a real summary, use it; otherwise use the greeting as summary
-    if barge_summary.startswith("Supervisor spoke directly") or barge_summary.startswith("Supervisor spoke briefly"):
-        barge_summary = resume_greeting  # Use the context-aware greeting as the summary
-    print(f"[HANDBACK] Summary: {barge_summary}")
-
-    # STEP 4: Enrich the resume history with barge context.
-    resumed_history = list(history)  # Full prior history
-
-    # Add the full barge transcript to history (AI gets complete context)
-    if barge_transcript:
-        resumed_history.append({
-            "role": "system",
-            "content": (
-                "BARGE CONVERSATION TRANSCRIPT — The supervisor spoke directly with the "
-                "customer. Here is what was said:\n\n"
-                f"{barge_transcript}"
-            ),
-        })
-
-    # Add summary + resume instructions
-    resumed_history.append({
-        "role": "system",
-        "content": (
-            f"BARGE SUMMARY: {barge_summary}\n\n"
-            "You are now resuming control of this call after your supervisor spoke with the customer.\n"
-            "Rules for your VERY FIRST response:\n"
-            "1. Do NOT greet the customer. Do NOT say hello, hi, or any greeting.\n"
-            "2. Do NOT introduce yourself again.\n"
-            "3. Briefly summarize what was resolved during the supervisor's conversation "
-            "(based on the BARGE SUMMARY above) so the customer knows you're up to speed.\n"
-            "4. Then ask 'Is there anything else I can help you with?'\n"
-            "5. Keep it to 2 sentences max. You are mid-conversation, not starting a new one.\n"
-            "Example format: 'Great, so [summary of what supervisor resolved]. "
-            "Is there anything else I can help you with today?'"
-        ),
-    })
-
-    # Transfer transcript_events to resume key (append barge summary)
+    # Transfer transcript_events to resume key immediately (before background work)
     resume_key = f"resume_{call_sid}"
     original_events = preserved.get("transcript_events", [])
-    import time as _t
     transcript_events[resume_key] = list(original_events)
-    transcript_events[resume_key].append(
-        {"role": "summary", "content": barge_summary, "ts": _t.time()}
-    )
-    print(f"[HANDBACK] Transferred {len(original_events)} transcript event(s) + summary to {resume_key}")
-
-    # Update the resume history and dashboard state with barge context
-    conversation_history[resume_key] = resumed_history
-    resuming_calls[call_sid]["history"] = resumed_history
+    print(f"[HANDBACK] Transferred {len(original_events)} transcript event(s) to {resume_key}")
 
     # Transfer coaching notes to resume key so they persist after barge
     original_coaching = preserved.get("coaching_notes", [])
@@ -1090,7 +1086,97 @@ async def observe_handback(body: ObserveBargeRequest):
     active_coaching_notes.pop(conv_id, None)  # Coaching notes now under resume_key
     voice_channel._conversations.pop(conv_id, None)
 
-    return {"status": "handback_complete", "call_sid": call_sid, "summary": barge_summary}
+    # Add placeholder event — dashboard shows a loading indicator until summary arrives
+    import time as _t
+    transcript_events[resume_key].append(
+        {"role": "summary", "content": "__loading__", "ts": _t.time()}
+    )
+
+    # STEP 4: Kick off transcription + summarization in the background.
+    # Whisper transcribes the barge recording, then GPT-4o summarizes it for the dashboard.
+    async def _enrich_resume_context():
+        try:
+            print(f"[HANDBACK-BG] Transcribing barge audio for {call_sid}...")
+            barge_transcript = await transcribe_barge_audio(call_sid)
+            print(f"[HANDBACK-BG] Transcript ({len(barge_transcript)} chars): {barge_transcript[:100]}...")
+
+            # Summarize the transcript for the dashboard display
+            barge_summary = await summarize_barge_conversation(barge_transcript)
+            display_text = barge_summary if barge_summary else resume_greeting
+            print(f"[HANDBACK-BG] Summary: {display_text[:100]}...")
+
+            # Enrich the resume history with barge context for AI
+            resumed_history = list(history)
+            if barge_transcript:
+                resumed_history.append({
+                    "role": "system",
+                    "content": (
+                        "BARGE CONVERSATION TRANSCRIPT — The supervisor spoke directly with the "
+                        "customer. Here is what was said:\n\n"
+                        f"{barge_transcript}"
+                    ),
+                })
+            resumed_history.append({
+                "role": "system",
+                "content": (
+                    "You are now resuming control of this call after your supervisor spoke with the customer.\n"
+                    "Rules for your VERY FIRST response:\n"
+                    "1. Do NOT greet the customer. Do NOT say hello, hi, or any greeting.\n"
+                    "2. Do NOT introduce yourself again.\n"
+                    "3. Briefly reference what was discussed during the supervisor's conversation "
+                    "so the customer knows you're up to speed.\n"
+                    "4. Then ask 'Is there anything else I can help you with?'\n"
+                    "5. Keep it to 2 sentences max. You are mid-conversation, not starting a new one."
+                ),
+            })
+
+            # Update resume state (may already have been consumed if customer spoke fast)
+            if resume_key in conversation_history:
+                conversation_history[resume_key] = resumed_history
+            if call_sid in resuming_calls:
+                resuming_calls[call_sid]["history"] = resumed_history
+
+            # Replace the placeholder with real transcript — find wherever the events live now
+            def _replace_placeholder(events_list: list[dict]) -> bool:
+                for i, ev in enumerate(events_list):
+                    if ev.get("role") == "summary" and ev.get("content") == "__loading__":
+                        events_list[i] = {"role": "summary", "content": display_text, "ts": _t.time()}
+                        return True
+                return False
+
+            if resume_key in transcript_events:
+                _replace_placeholder(transcript_events[resume_key])
+            else:
+                replaced = False
+                for cid, sess in voice_channel._conversations.items():
+                    if sess.call_sid == call_sid and cid in transcript_events:
+                        replaced = _replace_placeholder(transcript_events[cid])
+                        break
+                if not replaced:
+                    transcript_events.setdefault(resume_key, []).append(
+                        {"role": "summary", "content": display_text, "ts": _t.time()}
+                    )
+            print(f"[HANDBACK-BG] Resume context enriched for {call_sid}")
+        except Exception as e:
+            print(f"[HANDBACK-BG] Error enriching resume context: {e}")
+            # Replace placeholder with fallback so it doesn't stay loading forever
+            def _replace_with_fallback(events_list: list[dict]) -> bool:
+                for i, ev in enumerate(events_list):
+                    if ev.get("role") == "summary" and ev.get("content") == "__loading__":
+                        events_list[i] = {"role": "summary", "content": resume_greeting, "ts": _t.time()}
+                        return True
+                return False
+            if resume_key in transcript_events:
+                _replace_with_fallback(transcript_events[resume_key])
+            else:
+                for cid, sess in voice_channel._conversations.items():
+                    if sess.call_sid == call_sid and cid in transcript_events:
+                        _replace_with_fallback(transcript_events[cid])
+                        break
+
+    asyncio.create_task(_enrich_resume_context())
+
+    return {"status": "handback_complete", "call_sid": call_sid}
 
 
 # Barge conference status callback — cleanup when customer hangs up during barge
@@ -1256,7 +1342,9 @@ async def transcribe_barge_audio(call_sid: str) -> str:
             audio_data = response.content
             print(f"[transcribe] Downloaded {len(audio_data)} bytes")
 
-        # Send to OpenAI Whisper
+        # Send to OpenAI Whisper with domain-specific prompt to improve accuracy.
+        # The prompt parameter conditions Whisper's vocabulary — without it, phone-quality
+        # audio causes severe hallucination of domain terms (e.g. "Camping World" → "Fiverr").
         wav_buffer = io.BytesIO(audio_data)
         wav_buffer.name = "barge_recording.wav"
 
@@ -1265,6 +1353,13 @@ async def transcribe_barge_audio(call_sid: str) -> str:
             model="whisper-1",
             file=wav_buffer,
             language="en",
+            prompt=(
+                "Camping World, RV, trade-in, appraisal, Montana High Country, "
+                "Grand Design, Keystone Cougar, appointment, Saturday, Sunday, "
+                "scheduling, supervisor, customer service, 10am, 2pm, specialist, "
+                "walkthrough, confirmation, phone number"
+            ),
+            temperature=0.0,
         )
         transcript_text = transcription.text.strip()
         print(f"[transcribe] Full result ({len(transcript_text)} chars): {transcript_text}")
