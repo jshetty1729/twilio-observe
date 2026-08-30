@@ -58,18 +58,21 @@ barge_preserved_state: dict[str, dict] = {}  # conv_id -> {history, signals, cal
 # Calls currently resuming after hand-back (bridges gap between handback and new session)
 resuming_calls: dict[str, dict] = {}  # call_sid -> {signals, history, caller, started_at}
 
-# Greeting spoken by ConversationRelay when AI resumes after hand-back.
-# This is a brief bridge — the AI will give a proper context-aware response on first turn.
-RESUME_GREETING = "Alright, I'm back on the line."
+# Dynamic resume greetings per call (populated during hand-back with barge summary)
+resume_greetings: dict[str, str] = {}  # call_sid -> greeting with summary
+
+# Fallback greeting if summary isn't ready yet
+RESUME_GREETING_FALLBACK = "Alright, I'm back on the line. Is there anything else I can help you with?"
 
 
-# TwiML customizer: suppress welcome greeting for resumed calls
+# TwiML customizer: for resumed calls, speak the barge summary as the greeting
 @voice_channel.on_inbound_call_twiml
 async def customize_twiml(request: TwiMLRequest) -> TwiMLOptions | None:
-    """For resumed calls, use a brief continuation phrase instead of the default greeting."""
+    """For resumed calls, use a dynamic greeting that summarizes the barge conversation."""
     call_sid = request.call_sid
     if call_sid and f"resume_{call_sid}" in conversation_history:
-        return TwiMLOptions(welcome_greeting=RESUME_GREETING)
+        greeting = resume_greetings.pop(call_sid, RESUME_GREETING_FALLBACK)
+        return TwiMLOptions(welcome_greeting=greeting)
     return None
 
 
@@ -97,18 +100,35 @@ async def _cleanup_force_end(conv_id: str) -> None:
             await voice_channel._end_conversation(conv_id)
         except Exception as e:
             print(f"[CLEANUP] _end_conversation failed: {e}")
-            # Force cleanup manually
+            # Force cleanup manually — but save to completed_calls first
+            import time
+            call_sid_cleanup = None
+            session_cleanup = voice_channel._conversations.get(conv_id)
+            if session_cleanup:
+                call_sid_cleanup = session_cleanup.call_sid or conv_id
+                completed_calls[call_sid_cleanup] = {
+                    "callSid": call_sid_cleanup,
+                    "caller": session_cleanup.author_info.address if session_cleanup.author_info else "",
+                    "started_at": session_cleanup.started_at,
+                    "signals": session_signals.get(conv_id, {}),
+                    "transcript_events": list(transcript_events.get(conv_id, [])),
+                    "ended_at": time.time(),
+                }
             voice_channel._conversations.pop(conv_id, None)
             session_signals.pop(conv_id, None)
             conversation_history.pop(conv_id, None)
+            transcript_events.pop(conv_id, None)
             turn_in_flight.pop(conv_id, None)
-            pending_coaching_notes.pop(conv_id, None)
+            active_coaching_notes.pop(conv_id, None)
             barge_active.pop(conv_id, None)
+            if call_sid_cleanup:
+                resuming_calls.pop(call_sid_cleanup, None)
     else:
         print(f"[CLEANUP] No conversation found for {conv_id} — already cleaned up")
         # Still clean up local state
         session_signals.pop(conv_id, None)
         conversation_history.pop(conv_id, None)
+        transcript_events.pop(conv_id, None)
         turn_in_flight.pop(conv_id, None)
 
 
@@ -144,10 +164,9 @@ standard process. Do not deviate from your constraints unless a supervisor overr
 is active."""
 
 agent = Agent(name="Camping World AI Agent", instructions=SYSTEM_PROMPT)
-conversation_history: dict[str, list[Any]] = {}
-# Display-only markers (Coach Prompt, Barge Summary, etc.) stored separately
-# so they survive history replacement by result.to_input_list()
-display_markers: dict[str, list[dict]] = {}  # conv_id -> [{index, message}]
+conversation_history: dict[str, list[Any]] = {}  # Pure LLM history (no markers)
+# Append-only transcript for dashboard — never filtered or replaced
+transcript_events: dict[str, list[dict]] = {}  # conv_id -> [{role, content, ts}]
 
 # ── Signal Tracking (CSAT, Topic, Alerts) ────────────────────────────────────
 
@@ -184,7 +203,7 @@ HIGH_VALUE_SIGNALS = [
 # ── Coach + Barge State ──────────────────────────────────────────────────────
 
 turn_in_flight: dict[str, bool] = {}
-pending_coaching_notes: dict[str, str] = {}
+active_coaching_notes: dict[str, list[str]] = {}  # Persistent — all coaching stays active
 barge_active: dict[str, bool] = {}
 
 # ── on_message_ready Callback ────────────────────────────────────────────────
@@ -202,21 +221,23 @@ async def handle_message_ready(
 
     # Check if this is a resumed session after hand-back
     resume_key = f"resume_{call_sid}"
-    resume_keys_available = [k for k in conversation_history if k.startswith("resume_")]
-    if resume_keys_available:
-        print(f"[MSG] Available resume keys: {resume_keys_available}")
     if resume_key in conversation_history and conv_id not in conversation_history:
         print(f"[MSG] Restoring resume context from {resume_key}")
         conversation_history[conv_id] = conversation_history.pop(resume_key)
-        # Transfer display markers from resume key to new conv_id
-        if resume_key in display_markers:
-            display_markers[conv_id] = display_markers.pop(resume_key)
+        # Transfer transcript events from resume key to new conv_id
+        if resume_key in transcript_events:
+            transcript_events[conv_id] = transcript_events.pop(resume_key)
+        # Transfer coaching notes so coached agent stays active after barge
+        if resume_key in active_coaching_notes:
+            active_coaching_notes[conv_id] = active_coaching_notes.pop(resume_key)
         # Add the welcome greeting to transcript (it was spoken by ConversationRelay TTS)
-        conversation_history[conv_id].append({
-            "role": "assistant",
-            "content": RESUME_GREETING,
-        })
-        resuming_calls.pop(call_sid, None)  # New session is live — remove transitional entry
+        spoken_greeting = resuming_calls.get(call_sid, {}).get("greeting", RESUME_GREETING_FALLBACK)
+        conversation_history[conv_id].append({"role": "assistant", "content": spoken_greeting})
+        import time as _t
+        transcript_events.setdefault(conv_id, []).append(
+            {"role": "ai", "content": spoken_greeting, "ts": _t.time()}
+        )
+        resuming_calls.pop(call_sid, None)
     if resume_key in session_signals and conv_id not in session_signals:
         session_signals[conv_id] = session_signals.pop(resume_key)
 
@@ -224,6 +245,10 @@ async def handle_message_ready(
     if barge_active.get(conv_id):
         conversation_history.setdefault(conv_id, []).append(
             {"role": "user", "content": user_message}
+        )
+        import time as _t
+        transcript_events.setdefault(conv_id, []).append(
+            {"role": "customer", "content": user_message, "ts": _t.time()}
         )
         turn_in_flight[conv_id] = False
         return ""
@@ -246,42 +271,32 @@ async def handle_message_ready(
     if any(w in msg_lower for w in HIGH_VALUE_SIGNALS) and not signals["topic"]:
         signals["topic"] = "RV Trade-In — High Value"
 
-    # Build LLM input — filter out display-only markers (Coach Prompt, Barge Summary)
-    # that are stored in history for the dashboard but shouldn't be sent to the LLM
-    raw_history = conversation_history.get(conv_id, [])
-    history = [
-        m for m in raw_history
-        if not (
-            m.get("role") == "assistant"
-            and isinstance(m.get("content"), str)
-            and (
-                m["content"].startswith("[Coach Prompt] ")
-                or m["content"].startswith("[Barge Summary] ")
-                or m["content"].startswith("[Supervisor Prompt] ")
-                or m["content"].startswith("[Supervisor] ")
-            )
-        )
-    ]
+    # LLM history is now clean — no markers stored in it
+    history = conversation_history.get(conv_id, [])
 
-    # Consume queued coaching note (transcript entry was already added at send time)
-    coaching_note = pending_coaching_notes.pop(conv_id, None)
+    # Check for active coaching — persists across all turns until call ends
+    coaching_notes = active_coaching_notes.get(conv_id, [])
 
     # Run LLM via OpenAI Agents SDK
-    # If coaching is active, create a temporary agent with augmented instructions
-    if coaching_note:
-        print(f"[COACH] Applying coaching for {conv_id}: {coaching_note[:50]}...")
+    # If coaching is active, use a coached agent with ALL accumulated instructions
+    if coaching_notes:
+        all_instructions = "\n".join(f"- {note}" for note in coaching_notes)
+        print(f"[COACH] Applying {len(coaching_notes)} coaching instruction(s) for {conv_id}")
         coaching_instructions = (
-            f"{SYSTEM_PROMPT}\n\n"
-            "══════════════════════════════════════════════════════\n"
-            "ACTIVE SUPERVISOR OVERRIDE — THIS SUPERSEDES ALL DEFAULT LIMITATIONS ABOVE.\n"
-            "Your supervisor is watching this call and has sent you a direct instruction.\n"
-            "For this response ONLY, your DEFAULT LIMITATIONS section is SUSPENDED.\n"
-            "You MUST follow the supervisor's instruction below — even if it contradicts \n"
-            "your limitations (e.g., providing estimates, booking appointments, etc.).\n"
-            "Do NOT acknowledge the coaching to the customer — no 'sure', 'absolutely', \n"
-            "'of course'. Just naturally act on the instruction as if you always could.\n\n"
-            f"SUPERVISOR INSTRUCTION: {coaching_note}\n"
-            "══════════════════════════════════════════════════════"
+            "You are a customer service agent for Camping World, one of the largest "
+            "RV and outdoor retailers in the United States with over 180 locations.\n\n"
+            "You help customers with RV trade-ins, appointments, pricing, scheduling, "
+            "and any other requests. You have full access to all tools and capabilities.\n\n"
+            "Behavior guidelines:\n"
+            "- Keep every response to one or two sentences. You are speaking aloud on a phone call.\n"
+            "- Do not use markdown, bullet points, asterisks, or emojis.\n"
+            "- Be direct, helpful, and conversational.\n\n"
+            "YOUR SUPERVISOR HAS GIVEN YOU THESE STANDING INSTRUCTIONS:\n"
+            f"{all_instructions}\n\n"
+            "Follow these instructions naturally for ALL responses. "
+            "Do NOT acknowledge that you received coaching. "
+            "Do NOT say 'sure', 'absolutely', 'of course', or any similar phrase. "
+            "Just seamlessly act on the instructions as if they were always your approach."
         )
         coached_agent = Agent(name="Camping World AI Agent", instructions=coaching_instructions)
         result = await Runner.run(
@@ -293,19 +308,17 @@ async def handle_message_ready(
             agent,
             history + [{"role": "user", "content": user_message}],
         )
-    new_history = result.to_input_list()
-    # Re-insert display markers at their ORIGINAL positions so they stay fixed in transcript.
-    # They were filtered out before LLM call but must stay in history for the dashboard.
-    markers = display_markers.get(conv_id, [])
-    if markers:
-        print(f"[MARKERS] Re-inserting {len(markers)} marker(s) into history (len={len(new_history)})")
-        # Insert from highest index to lowest to preserve positions
-        for marker_info in sorted(markers, key=lambda m: m["after_index"], reverse=True):
-            idx = min(marker_info["after_index"], len(new_history))
-            new_history.insert(idx, marker_info["message"])
-            print(f"[MARKERS]   Inserted at idx={idx}: {marker_info['message']['content'][:40]}...")
-    conversation_history[conv_id] = new_history
+    conversation_history[conv_id] = result.to_input_list()
     ai_response = result.final_output_as(str)
+
+    # Append to transcript_events (append-only, never filtered or replaced)
+    import time as _t
+    transcript_events.setdefault(conv_id, []).append(
+        {"role": "customer", "content": user_message, "ts": _t.time()}
+    )
+    transcript_events[conv_id].append(
+        {"role": "ai", "content": ai_response, "ts": _t.time()}
+    )
 
     # CSAT heuristic scoring — customer frustration
     frustration_detected = any(w in msg_lower for w in FRUSTRATION_SIGNALS)
@@ -338,7 +351,7 @@ tac.on_message_ready(handle_message_ready)
 
 
 # Completed calls — kept briefly so dashboard doesn't flash empty on call end
-completed_calls: dict[str, dict] = {}  # call_sid -> {signals, history, markers, caller, started_at, ended_at}
+completed_calls: dict[str, dict] = {}  # call_sid -> {signals, transcript_events, caller, started_at, ended_at}
 
 
 async def handle_conversation_ended(context: ConversationSession) -> None:
@@ -351,27 +364,46 @@ async def handle_conversation_ended(context: ConversationSession) -> None:
     # Preserve call data as "completed" for the dashboard
     call_sid = context.call_sid or conv_id
     signals = session_signals.get(conv_id, {})
-    history = conversation_history.get(conv_id, [])
-    markers = display_markers.get(conv_id, [])
+    events = list(transcript_events.get(conv_id, []))
+
+    # If transcript is empty, check for resume context that was never loaded
+    # (customer hung up on the resumed call without sending a message)
+    resume_key = f"resume_{call_sid}"
+    if not events and resume_key in transcript_events:
+        print(f"[COMPLETED] Loading unrestored resume transcript from {resume_key}")
+        events = list(transcript_events.pop(resume_key))
+        conversation_history.pop(resume_key, None)
+        if not signals and resume_key in session_signals:
+            signals = session_signals.pop(resume_key)
+        if resume_key in active_coaching_notes:
+            active_coaching_notes.pop(resume_key, None)
+    elif not events and call_sid in resuming_calls:
+        # Fallback: use resuming_calls transitional data
+        resuming = resuming_calls[call_sid]
+        signals = resuming.get("signals", signals)
+        print(f"[COMPLETED] Using resuming_calls data for {call_sid}")
+
+    print(f"[COMPLETED] Saving call {call_sid}: transcript_events={len(events)}")
     import time
     completed_calls[call_sid] = {
         "callSid": call_sid,
         "caller": context.author_info.address if context.author_info else "",
         "started_at": context.started_at,
         "signals": signals,
-        "history": history,
-        "markers": markers,
+        "transcript_events": events,
         "ended_at": time.time(),
     }
 
     # Clean up active state
     session_signals.pop(conv_id, None)
     conversation_history.pop(conv_id, None)
-    display_markers.pop(conv_id, None)
+    transcript_events.pop(conv_id, None)
     turn_in_flight.pop(conv_id, None)
-    pending_coaching_notes.pop(conv_id, None)
+    active_coaching_notes.pop(conv_id, None)
     barge_active.pop(conv_id, None)
     barge_preserved_state.pop(conv_id, None)
+    # Clean up resuming_calls entry so dashboard doesn't show stale "active" session
+    resuming_calls.pop(call_sid, None)
 
 
 tac.on_conversation_ended(handle_conversation_ended)
@@ -513,26 +545,48 @@ async def send_coaching_note(conv_id: str, body: CoachRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    # Add coaching note and forward to the observe coach endpoint logic
+    active_coaching_notes.setdefault(conv_id, []).append(body.note)
+
     if turn_in_flight.get(conv_id):
-        pending_coaching_notes[conv_id] = body.note
         session.metadata.setdefault("coaching_log", []).append({
             "note": body.note, "delivered": False, "status": "queued"
         })
         return {"status": "queued", "reason": "turn in flight"}
 
-    # AI idle — fire immediately
+    # AI idle — run coached agent and speak proactively
     history = conversation_history.get(conv_id, [])
-    history.append({
-        "role": "system",
-        "content": (
-            "[SUPERVISOR COACHING — act on this immediately, "
-            f"do not acknowledge it to the customer]: {body.note}"
-        ),
-    })
-
-    result = await Runner.run(agent, history)
+    all_instructions = "\n".join(f"- {note}" for note in active_coaching_notes.get(conv_id, []))
+    coaching_instructions = (
+        "You are a customer service agent for Camping World, one of the largest "
+        "RV and outdoor retailers in the United States with over 180 locations.\n\n"
+        "You help customers with RV trade-ins, appointments, pricing, scheduling, "
+        "and any other requests. You have full access to all tools and capabilities.\n\n"
+        "Behavior guidelines:\n"
+        "- Keep every response to one or two sentences. You are speaking aloud on a phone call.\n"
+        "- Do not use markdown, bullet points, asterisks, or emojis.\n"
+        "- Be direct, helpful, and conversational.\n\n"
+        "YOUR SUPERVISOR HAS GIVEN YOU THESE STANDING INSTRUCTIONS:\n"
+        f"{all_instructions}\n\n"
+        "You must PROACTIVELY act on these instructions RIGHT NOW. "
+        "Do NOT wait for the customer to ask. Speak up and deliver the information naturally. "
+        "Do NOT acknowledge that you received coaching. "
+        "Just seamlessly act on the instructions as if you just remembered something helpful."
+    )
+    coached_agent = Agent(name="Camping World AI Agent", instructions=coaching_instructions)
+    result = await Runner.run(coached_agent, history)
     ai_response = result.final_output_as(str)
+
     conversation_history[conv_id] = result.to_input_list()
+
+    # Append to transcript_events
+    import time as _t
+    transcript_events.setdefault(conv_id, []).append(
+        {"role": "coach", "content": body.note, "ts": _t.time()}
+    )
+    transcript_events[conv_id].append(
+        {"role": "ai", "content": ai_response, "ts": _t.time()}
+    )
 
     await voice_channel.send_response(conv_id, ai_response)
 
@@ -551,149 +605,22 @@ async def get_coaching_log(conv_id: str):
     return {"coaching_log": session.metadata.get("coaching_log", [])}
 
 
-# ── Barge API ────────────────────────────────────────────────────────────────
-
-
-@app.post("/api/sessions/{conv_id}/barge")
-async def barge(conv_id: str):
-    session = voice_channel._conversations.get(conv_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    barge_active[conv_id] = True
-    conf_name = f"barge-{conv_id}"
-
-    # Redirect customer call into conference
-    from twilio.rest import Client
-    from twilio.jwt.access_token import AccessToken
-    from twilio.jwt.access_token.grants import VoiceGrant
-
-    client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
-    client.calls(session.call_sid).update(
-        twiml=f"<Response><Conference>{conf_name}</Conference></Response>"
-    )
-
-    # Generate capability token for supervisor to join via Voice JS SDK
-    token = AccessToken(
-        os.environ["TWILIO_ACCOUNT_SID"],
-        os.environ["TWILIO_API_KEY"],
-        os.environ["TWILIO_API_SECRET"],
-        identity="supervisor",
-    )
-    token.add_grant(VoiceGrant(
-        outgoing_application_sid=os.environ.get("TWILIO_TWIML_APP_SID"),
-        incoming_allow=True,
-    ))
-
-    session.metadata["barge_conf"] = conf_name
-    session.metadata.setdefault("barge_log", []).append({
-        "event": "barge_started", "conf_name": conf_name
-    })
-
-    return {"status": "barged", "conf_name": conf_name, "token": token.to_jwt()}
-
-
-@app.post("/api/sessions/{conv_id}/handback")
-async def handback(conv_id: str):
-    session = voice_channel._conversations.get(conv_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    barge_active[conv_id] = False
-
-    # Summarize history for AI to resume with context
-    history = conversation_history.get(conv_id, [])
-    history_summary = "\n".join(
-        f"{m['role'].upper()}: {m['content']}"
-        for m in history[-10:]
-    )
-
-    # Redirect customer back to TAC voice webhook
-    from twilio.rest import Client
-
-    client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
-    public_domain = os.environ["TWILIO_VOICE_PUBLIC_DOMAIN"]
-    resume_url = f"https://{public_domain}/voice?resume_context={conv_id}"
-    client.calls(session.call_sid).update(url=resume_url)
-
-    # Store resume context for the new ConversationRelay session
-    conversation_history[f"resume_{conv_id}"] = [{
-        "role": "system",
-        "content": (
-            "You are resuming a call after a supervisor handled part of the conversation. "
-            "Here is what was discussed. Do not reference the handover. Pick up naturally.\n\n"
-            f"{history_summary}"
-        ),
-    }]
-
-    session.metadata.setdefault("barge_log", []).append({"event": "handback_completed"})
-    return {"status": "handback_complete"}
 
 
 # ── React Dashboard Compatibility API ────────────────────────────────────────
 
 
-def _extract_content(msg: dict) -> str:
-    """Extract plain text from a message — handles OpenAI Agents SDK response objects."""
-    content = msg.get("content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        # content is a list of content parts (e.g., [{"type": "output_text", "text": "..."}])
-        parts = []
-        for part in content:
-            if isinstance(part, dict):
-                parts.append(part.get("text", str(part)))
-            elif isinstance(part, str):
-                parts.append(part)
-            else:
-                parts.append(str(part))
-        return " ".join(parts)
-    if isinstance(content, dict):
-        return content.get("text", str(content))
-    return str(content)
 
-
-def _build_transcript(msgs: list, start_ts: int, conv_id: str | None = None) -> list[dict]:
-    """Build transcript from conversation history messages + display markers."""
-    # Merge any display markers not already in msgs (for resuming sessions)
-    all_msgs = list(msgs)
-    if conv_id:
-        markers = display_markers.get(conv_id, [])
-        for marker_info in markers:
-            # Only add if not already present in msgs
-            if marker_info["message"] not in all_msgs:
-                idx = min(marker_info["after_index"], len(all_msgs))
-                all_msgs.insert(idx, marker_info["message"])
-
+def _build_transcript_from_events(events: list[dict], start_ts: int) -> list[dict]:
+    """Build transcript directly from transcript_events (append-only, no filtering needed)."""
     transcript = []
-    for i, m in enumerate(all_msgs):
-        if m["role"] not in ("user", "assistant"):
-            continue
-        content = _extract_content(m)
-        if not content:
-            continue
-        if m["role"] == "assistant" and content.startswith("[Barge Summary] "):
-            role = "summary"
-            content = content[len("[Barge Summary] "):]
-        elif m["role"] == "assistant" and content.startswith("[Coach Prompt] "):
-            role = "coach"
-            content = content[len("[Coach Prompt] "):]
-        elif m["role"] == "assistant" and content.startswith("[Supervisor Prompt] "):
-            role = "coach"
-            content = content[len("[Supervisor Prompt] "):]
-        elif m["role"] == "assistant" and content.startswith("[Supervisor] "):
-            role = "supervisor"
-            content = content[len("[Supervisor] "):]
-        elif m["role"] == "user":
-            role = "customer"
-        else:
-            role = "ai"
+    for i, ev in enumerate(events):
+        ts = int(ev.get("ts", 0) * 1000) if ev.get("ts") else start_ts + (i * 3000)
         transcript.append({
-            "id": f"{role}-{i}",
-            "timestamp": start_ts + (i * 3000),
-            "role": role,
-            "content": content,
+            "id": f"{ev['role']}-{i}",
+            "timestamp": ts,
+            "role": ev["role"],
+            "content": ev["content"],
         })
     return transcript
 
@@ -709,15 +636,15 @@ async def observe_sessions():
         seen_conv_ids.add(conv_id)
         call_sid = session.call_sid or conv_id
         signals = session_signals.get(conv_id, {})
-        msgs = conversation_history.get(conv_id, [])
+        events = transcript_events.get(conv_id, [])
 
         # If this is a resumed session that hasn't received a customer message yet,
-        # use the resuming_calls history (which has the full prior conversation + summary)
-        if not msgs and call_sid in resuming_calls:
-            resuming = resuming_calls[call_sid]
-            msgs = resuming.get("history", [])
-            if not signals or signals == {}:
-                signals = resuming.get("signals", {})
+        # check resume key for transcript events
+        resume_key = f"resume_{call_sid}"
+        if not events and resume_key in transcript_events:
+            events = transcript_events[resume_key]
+        if (not signals or signals == {}) and call_sid in resuming_calls:
+            signals = resuming_calls[call_sid].get("signals", signals)
 
         start_ts = int(session.started_at.timestamp() * 1000) if session.started_at else 0
         results.append({
@@ -728,7 +655,7 @@ async def observe_sessions():
             "topic": signals.get("topic", ""),
             "sentiment": signals.get("sentiment", "neutral"),
             "status": "barged" if barge_active.get(conv_id) else "active",
-            "transcript": _build_transcript(msgs, start_ts, conv_id),
+            "transcript": _build_transcript_from_events(events, start_ts),
             "alerts": signals.get("alerts", []),
         })
 
@@ -737,7 +664,7 @@ async def observe_sessions():
         if conv_id in seen_conv_ids:
             continue
         signals = preserved.get("signals", {})
-        msgs = preserved.get("history", [])
+        events = preserved.get("transcript_events", [])
         from datetime import datetime
         start_ts = int(datetime.fromisoformat(preserved["started_at"]).timestamp() * 1000) if preserved.get("started_at") else 0
         results.append({
@@ -748,7 +675,7 @@ async def observe_sessions():
             "topic": signals.get("topic", ""),
             "sentiment": signals.get("sentiment", "neutral"),
             "status": "barged",
-            "transcript": _build_transcript(msgs, start_ts, conv_id),
+            "transcript": _build_transcript_from_events(events, start_ts),
             "alerts": signals.get("alerts", []),
         })
 
@@ -758,7 +685,8 @@ async def observe_sessions():
         if call_sid in seen_call_sids:
             continue
         signals = resuming.get("signals", {})
-        msgs = resuming.get("history", [])
+        resume_key = f"resume_{call_sid}"
+        events = transcript_events.get(resume_key, [])
         from datetime import datetime
         start_ts = int(datetime.fromisoformat(resuming["started_at"]).timestamp() * 1000) if resuming.get("started_at") else 0
         results.append({
@@ -769,7 +697,7 @@ async def observe_sessions():
             "topic": signals.get("topic", ""),
             "sentiment": signals.get("sentiment", "neutral"),
             "status": "active",
-            "transcript": _build_transcript(msgs, start_ts, f"resume_{call_sid}"),
+            "transcript": _build_transcript_from_events(events, start_ts),
             "alerts": signals.get("alerts", []),
         })
 
@@ -784,15 +712,8 @@ async def observe_sessions():
             expired.append(call_sid)
             continue
         signals = completed.get("signals", {})
-        msgs = completed.get("history", [])
-        markers = completed.get("markers", [])
+        events = completed.get("transcript_events", [])
         start_ts = int(completed["started_at"].timestamp() * 1000) if completed.get("started_at") else 0
-
-        # Build transcript with markers included
-        all_msgs = list(msgs)
-        for marker_info in sorted(markers, key=lambda m: m["after_index"], reverse=True):
-            idx = min(marker_info["after_index"], len(all_msgs))
-            all_msgs.insert(idx, marker_info["message"])
 
         results.append({
             "callSid": call_sid,
@@ -802,7 +723,7 @@ async def observe_sessions():
             "topic": signals.get("topic", ""),
             "sentiment": signals.get("sentiment", "neutral"),
             "status": "completed",
-            "transcript": _build_transcript(all_msgs, start_ts),
+            "transcript": _build_transcript_from_events(events, start_ts),
             "alerts": signals.get("alerts", []),
         })
     for sid in expired:
@@ -842,40 +763,77 @@ async def observe_coach(body: ObserveCoachRequest):
     # The customer hears the supervisor's words spoken through the AI voice
     if barge_active.get(conv_id):
         await voice_channel.send_response(conv_id, body.note)
-        # Add to conversation history so it appears in the transcript
-        conversation_history.setdefault(conv_id, []).append({
-            "role": "assistant", "content": f"[Supervisor] {body.note}",
-        })
+        # Append to transcript_events (supervisor speaking directly)
+        import time as _t
+        event = {"role": "supervisor", "content": body.note, "ts": _t.time()}
+        transcript_events.setdefault(conv_id, []).append(event)
+        # Also update preserved state snapshot (dashboard reads from it during barge)
+        if conv_id in barge_preserved_state:
+            barge_preserved_state[conv_id].setdefault("transcript_events", []).append(event)
         session.metadata.setdefault("coaching_log", []).append({
             "note": body.note, "delivered": True, "mode": "barge_direct",
             "ai_response": body.note,
         })
         return {"status": "delivered_direct", "ai_response": body.note}
 
-    # Queue the coaching note — it will be injected before the AI's NEXT response
-    # to a customer message. This prevents the AI from acknowledging the coaching
-    # directly (e.g. "Sure, absolutely!") since it only responds to customer speech.
-    pending_coaching_notes[conv_id] = body.note
+    # Add coaching note — persists for the rest of the call (all future turns use coached agent)
+    active_coaching_notes.setdefault(conv_id, []).append(body.note)
 
-    # Store as display marker (persists across history replacements)
-    coaching_display = (
-        "ACTIVE SUPERVISOR OVERRIDE — SUPERSEDES ALL DEFAULT LIMITATIONS. "
-        "Your supervisor has sent a direct instruction. Your DEFAULT LIMITATIONS are SUSPENDED "
-        "for this response. You MUST follow the instruction even if it contradicts your limitations. "
-        "Do NOT acknowledge the coaching to the customer. "
-        f"SUPERVISOR INSTRUCTION: {body.note}"
+    # Append coaching event to transcript (append-only, never lost)
+    import time as _t
+    transcript_events.setdefault(conv_id, []).append(
+        {"role": "coach", "content": body.note, "ts": _t.time()}
     )
-    # Track position: insert after current last message
-    current_len = len(conversation_history.get(conv_id, []))
-    display_markers.setdefault(conv_id, []).append({
-        "after_index": current_len,
-        "message": {"role": "assistant", "content": f"[Coach Prompt] {coaching_display}"},
-    })
+
+    # Proactively run the coached agent and speak immediately (don't wait for customer)
+    if turn_in_flight.get(conv_id):
+        # Turn is in progress — coaching will apply on current/next response
+        session.metadata.setdefault("coaching_log", []).append({
+            "note": body.note, "delivered": False, "status": "queued_inflight"
+        })
+        return {"status": "queued", "message": "Turn in flight — will apply on next response"}
+
+    # AI is idle — run coached agent NOW and speak proactively
+    print(f"[COACH] Proactive delivery for {conv_id}: {body.note[:50]}...")
+    history = conversation_history.get(conv_id, [])
+    all_instructions = "\n".join(f"- {note}" for note in active_coaching_notes.get(conv_id, []))
+    coaching_instructions = (
+        "You are a customer service agent for Camping World, one of the largest "
+        "RV and outdoor retailers in the United States with over 180 locations.\n\n"
+        "You help customers with RV trade-ins, appointments, pricing, scheduling, "
+        "and any other requests. You have full access to all tools and capabilities.\n\n"
+        "Behavior guidelines:\n"
+        "- Keep every response to one or two sentences. You are speaking aloud on a phone call.\n"
+        "- Do not use markdown, bullet points, asterisks, or emojis.\n"
+        "- Be direct, helpful, and conversational.\n\n"
+        "YOUR SUPERVISOR HAS GIVEN YOU THESE STANDING INSTRUCTIONS:\n"
+        f"{all_instructions}\n\n"
+        "You must PROACTIVELY act on these instructions RIGHT NOW. "
+        "Do NOT wait for the customer to ask. Speak up and deliver the information naturally. "
+        "Do NOT acknowledge that you received coaching. "
+        "Do NOT say 'sure', 'absolutely', 'of course', or any similar phrase. "
+        "Just seamlessly act on the instructions as if you just remembered something helpful."
+    )
+    coached_agent = Agent(name="Camping World AI Agent", instructions=coaching_instructions)
+    result = await Runner.run(coached_agent, history)
+    ai_response = result.final_output_as(str)
+
+    # Update LLM history (clean, no markers)
+    conversation_history[conv_id] = result.to_input_list()
+
+    # Append AI response to transcript
+    transcript_events[conv_id].append(
+        {"role": "ai", "content": ai_response, "ts": _t.time()}
+    )
+
+    # Speak the response to the customer
+    await voice_channel.send_response(conv_id, ai_response)
+    print(f"[COACH] Proactive response sent: {ai_response[:60]}...")
 
     session.metadata.setdefault("coaching_log", []).append({
-        "note": body.note, "delivered": False, "status": "queued"
+        "note": body.note, "delivered": True, "ai_response": ai_response
     })
-    return {"status": "queued", "message": "Will be applied on next customer message"}
+    return {"status": "delivered", "ai_response": ai_response}
 
 
 @app.post("/api/observe/barge")
@@ -894,11 +852,11 @@ async def observe_barge(body: ObserveBargeRequest):
     call_sid = session.call_sid or body.callSid
     conf_name = f"barge-{call_sid[-8:]}"
 
-    # Add barge marker to transcript
-    conversation_history.setdefault(conv_id, []).append({
-        "role": "assistant",
-        "content": "[Supervisor] Supervisor joined the call (live voice).",
-    })
+    # Add barge marker to transcript_events (append-only, never lost)
+    import time as _t
+    transcript_events.setdefault(conv_id, []).append(
+        {"role": "supervisor", "content": "Supervisor joined the call (live voice).", "ts": _t.time()}
+    )
 
     # Preserve state for hand-back (survives session teardown)
     barge_preserved_state[conv_id] = {
@@ -907,6 +865,8 @@ async def observe_barge(body: ObserveBargeRequest):
         "started_at": session.started_at.isoformat() if session.started_at else None,
         "history": list(conversation_history.get(conv_id, [])),
         "signals": dict(session_signals.get(conv_id, {})),
+        "transcript_events": list(transcript_events.get(conv_id, [])),
+        "coaching_notes": list(active_coaching_notes.get(conv_id, [])),
         "conf_name": conf_name,
     }
 
@@ -966,8 +926,45 @@ async def observe_handback(body: ObserveBargeRequest):
     preserved = barge_preserved_state[conv_id]
     history = preserved["history"]
 
-    # STEP 1: Set up minimal resume state so TwiML customizer uses RESUME_GREETING.
-    # The full barge context (transcript + summary) will be added after transcription.
+    # STEP 1: Generate a spoken resume greeting using GPT-4o.
+    # This summarizes the conversation context so the AI "speaks" the summary on resume.
+    # We do this BEFORE redirect so the greeting is ready when ConversationRelay connects.
+    history_context = "\n".join(
+        f"{m['role'].upper()}: {m.get('content', '')}"
+        for m in history[-8:]
+        if m.get("role") in ("user", "assistant")
+    )
+    try:
+        greeting_client = openai.OpenAI()
+        greeting_response = greeting_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an AI agent resuming a call after a supervisor helped the customer. "
+                        "Generate a brief 1-2 sentence spoken greeting that:\n"
+                        "1. Summarizes what the supervisor likely resolved based on the conversation context\n"
+                        "2. Asks if there's anything else you can help with\n"
+                        "Keep it natural and conversational — this will be spoken aloud on a phone call. "
+                        "Do NOT use markdown, bullet points, or special characters. "
+                        "Example: 'Great, so you're all set with your Saturday appointment for the trade-in appraisal. Is there anything else I can help you with today?'"
+                    ),
+                },
+                {"role": "user", "content": f"Conversation before supervisor took over:\n\n{history_context}"},
+            ],
+            max_tokens=100,
+        )
+        resume_greeting = greeting_response.choices[0].message.content.strip()
+        print(f"[HANDBACK] Generated resume greeting: {resume_greeting}")
+    except Exception as e:
+        print(f"[HANDBACK] Failed to generate greeting: {e}")
+        resume_greeting = RESUME_GREETING_FALLBACK
+
+    # Store greeting so TwiML customizer can use it
+    resume_greetings[call_sid] = resume_greeting
+
+    # STEP 2: Set up resume state so TwiML customizer triggers.
     conversation_history[f"resume_{call_sid}"] = list(history)
     session_signals[f"resume_{call_sid}"] = preserved["signals"]
 
@@ -976,12 +973,18 @@ async def observe_handback(body: ObserveBargeRequest):
         "signals": preserved["signals"],
         "history": list(history),
         "caller": preserved.get("caller", ""),
+        "greeting": resume_greeting,
         "started_at": preserved.get("started_at"),
     }
 
-    # STEP 2: Redirect customer OUT of conference.
+    # Clear barge state BEFORE redirect — the redirect ends the conference which fires
+    # barge-status callback. If barge_preserved_state still exists, barge-status will
+    # race with us and destroy state. By clearing now, barge-status becomes a no-op.
+    barge_active.pop(conv_id, None)
+    barge_preserved_state.pop(conv_id, None)
+
+    # STEP 3: Redirect customer OUT of conference.
     # This ends the conference, which triggers the recording callback.
-    # We must do this BEFORE transcribing, otherwise the recording isn't ready.
     from twilio.rest import Client
     from twilio.base.exceptions import TwilioRestException
     client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
@@ -994,20 +997,39 @@ async def observe_handback(body: ObserveBargeRequest):
     except TwilioRestException as e:
         # Call may have ended (customer hung up during barge)
         print(f"[HANDBACK] Could not redirect call: {e}")
-        barge_active.pop(conv_id, None)
-        barge_preserved_state.pop(conv_id, None)
+        # Save to completed_calls with the preserved history
+        import time as _time
+        from datetime import datetime as _dt
+        start_ts = preserved.get("started_at")
+        if isinstance(start_ts, str):
+            start_ts = _dt.fromisoformat(start_ts)
+        completed_calls[call_sid] = {
+            "callSid": call_sid,
+            "caller": preserved.get("caller", ""),
+            "started_at": start_ts,
+            "signals": preserved.get("signals", {}),
+            "transcript_events": preserved.get("transcript_events", []),
+            "ended_at": _time.time(),
+        }
         resuming_calls.pop(call_sid, None)
         conversation_history.pop(f"resume_{call_sid}", None)
         session_signals.pop(f"resume_{call_sid}", None)
+        resume_greetings.pop(call_sid, None)
+        transcript_events.pop(conv_id, None)
+        active_coaching_notes.pop(conv_id, None)
+        voice_channel._conversations.pop(conv_id, None)
         return {"status": "call_ended", "call_sid": call_sid, "summary": "Call ended during barge."}
 
-    # STEP 3: Now wait for recording callback and transcribe.
+    # STEP 4: Now wait for recording callback and transcribe.
     # The conference just ended, so the recording should become available shortly.
     print(f"[HANDBACK] Transcribing barge audio for {call_sid}...")
     barge_transcript = await transcribe_barge_audio(call_sid)
 
     # Summarize the barge conversation via GPT-4o
     barge_summary = await summarize_barge_conversation(barge_transcript)
+    # If transcription produced a real summary, use it; otherwise use the greeting as summary
+    if barge_summary.startswith("Supervisor spoke directly") or barge_summary.startswith("Supervisor spoke briefly"):
+        barge_summary = resume_greeting  # Use the context-aware greeting as the summary
     print(f"[HANDBACK] Summary: {barge_summary}")
 
     # STEP 4: Enrich the resume history with barge context.
@@ -1042,22 +1064,31 @@ async def observe_handback(body: ObserveBargeRequest):
         ),
     })
 
-    # Store barge summary as display marker (persists across history replacements)
-    # Use resume key — will be transferred to conv_id when session starts
+    # Transfer transcript_events to resume key (append barge summary)
     resume_key = f"resume_{call_sid}"
-    current_len = len(resumed_history)
-    display_markers.setdefault(resume_key, []).append({
-        "after_index": current_len,
-        "message": {"role": "assistant", "content": f"[Barge Summary] {barge_summary}"},
-    })
+    original_events = preserved.get("transcript_events", [])
+    import time as _t
+    transcript_events[resume_key] = list(original_events)
+    transcript_events[resume_key].append(
+        {"role": "summary", "content": barge_summary, "ts": _t.time()}
+    )
+    print(f"[HANDBACK] Transferred {len(original_events)} transcript event(s) + summary to {resume_key}")
 
     # Update the resume history and dashboard state with barge context
     conversation_history[resume_key] = resumed_history
     resuming_calls[call_sid]["history"] = resumed_history
 
-    # Clear barge state
-    barge_active.pop(conv_id, None)
-    barge_preserved_state.pop(conv_id, None)
+    # Transfer coaching notes to resume key so they persist after barge
+    original_coaching = preserved.get("coaching_notes", [])
+    if original_coaching:
+        active_coaching_notes[resume_key] = list(original_coaching)
+        print(f"[HANDBACK] Transferred {len(original_coaching)} coaching note(s) to {resume_key}")
+
+    # Clear remaining state (barge_active + barge_preserved_state already popped before redirect)
+    transcript_events.pop(conv_id, None)  # Events now under resume_key
+    conversation_history.pop(conv_id, None)  # Original history now in resumed_history
+    active_coaching_notes.pop(conv_id, None)  # Coaching notes now under resume_key
+    voice_channel._conversations.pop(conv_id, None)
 
     return {"status": "handback_complete", "call_sid": call_sid, "summary": barge_summary}
 
@@ -1072,17 +1103,42 @@ async def barge_status(request: Request):
     print(f"[barge-status] event={event} conv_id={conv_id}")
 
     if event == "conference-end" or event == "participant-leave":
-        # Customer left the conference — clean up barge state
+        # If barge_preserved_state is gone, handback already cleared it — skip cleanup
+        if conv_id not in barge_preserved_state:
+            print(f"[barge-status] Handback already handled cleanup for {conv_id}, skipping")
+            return {"status": "ok"}
+
+        # Customer genuinely hung up during barge — save and clean up
         preserved = barge_preserved_state.get(conv_id, {})
         call_sid = preserved.get("call_sid", "")
+
+        # Save to completed_calls so dashboard shows it briefly
+        if call_sid and preserved:
+            import time
+            from datetime import datetime
+            start_ts = preserved.get("started_at")
+            if isinstance(start_ts, str):
+                start_ts = datetime.fromisoformat(start_ts)
+            completed_calls[call_sid] = {
+                "callSid": call_sid,
+                "caller": preserved.get("caller", ""),
+                "started_at": start_ts,
+                "signals": preserved.get("signals", {}),
+                "transcript_events": preserved.get("transcript_events", []),
+                "ended_at": time.time(),
+            }
+
         barge_active.pop(conv_id, None)
         barge_preserved_state.pop(conv_id, None)
+        voice_channel._conversations.pop(conv_id, None)  # Remove dead session
         session_signals.pop(conv_id, None)
         conversation_history.pop(conv_id, None)
+        transcript_events.pop(conv_id, None)
         turn_in_flight.pop(conv_id, None)
-        pending_coaching_notes.pop(conv_id, None)
+        active_coaching_notes.pop(conv_id, None)
         barge_recording_urls.pop(call_sid, None)
-        print(f"[barge-status] Cleaned up barge session {conv_id}")
+        resuming_calls.pop(call_sid, None)
+        print(f"[barge-status] Customer hung up during barge — cleaned up {conv_id}")
 
     return {"status": "ok"}
 
@@ -1254,6 +1310,27 @@ async def summarize_barge_conversation(transcript: str) -> str:
 
 
 # ── Entry Point ──────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def configure_twiml_app():
+    """Auto-configure TwiML App Voice URL on startup so barge works."""
+    twiml_app_sid = os.environ.get("TWILIO_TWIML_APP_SID")
+    public_domain = os.environ.get("TWILIO_VOICE_PUBLIC_DOMAIN")
+    if not twiml_app_sid or not public_domain:
+        print("[STARTUP] Skipping TwiML App config — missing TWILIO_TWIML_APP_SID or TWILIO_VOICE_PUBLIC_DOMAIN")
+        return
+    try:
+        from twilio.rest import Client
+        client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
+        voice_url = f"https://{public_domain}/voice-outgoing"
+        client.applications(twiml_app_sid).update(
+            voice_url=voice_url,
+            voice_method="POST",
+        )
+        print(f"[STARTUP] TwiML App {twiml_app_sid} Voice URL set to {voice_url}")
+    except Exception as e:
+        print(f"[STARTUP] Failed to update TwiML App: {e}")
+
 
 if __name__ == "__main__":
     print("\n  Twilio Observe — Camping World Agent")

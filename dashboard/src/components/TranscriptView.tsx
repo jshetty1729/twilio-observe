@@ -30,7 +30,7 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcript }) =>
             display="flex"
             justifyContent={
               turn.role === 'ai' ? 'flex-end' :
-              (turn.role === 'coach' || turn.role === 'summary') ? 'center' :
+              (turn.role === 'coach' || turn.role === 'summary' || turn.role === 'supervisor') ? 'center' :
               'flex-start'
             }
             marginBottom="space30"
@@ -45,12 +45,13 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcript }) =>
               }
               padding="space30"
               borderRadius="borderRadius20"
-              maxWidth={(turn.role === 'coach' || turn.role === 'summary') ? '90%' : '70%'}
-              borderLeftWidth={(turn.role === 'coach' || turn.role === 'summary') ? 'borderWidth30' : undefined}
-              borderLeftStyle={(turn.role === 'coach' || turn.role === 'summary') ? 'solid' : undefined}
+              maxWidth={(turn.role === 'coach' || turn.role === 'summary' || turn.role === 'supervisor') ? '90%' : '70%'}
+              borderLeftWidth={(turn.role === 'coach' || turn.role === 'summary' || turn.role === 'supervisor') ? 'borderWidth30' : undefined}
+              borderLeftStyle={(turn.role === 'coach' || turn.role === 'summary' || turn.role === 'supervisor') ? 'solid' : undefined}
               borderLeftColor={
                 turn.role === 'coach' ? 'colorBorderDestructive' :
                 turn.role === 'summary' ? 'colorBorderSuccess' :
+                turn.role === 'supervisor' ? 'colorBorderWarning' :
                 undefined
               }
             >
@@ -59,9 +60,10 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcript }) =>
                  turn.role === 'ai' ? 'AI Agent' :
                  turn.role === 'coach' ? 'Supervisor Prompt → AI Agent' :
                  turn.role === 'summary' ? 'Barge Summary (Supervisor ↔ Customer)' :
-                 'Supervisor'}
+                 turn.role === 'supervisor' ? 'Supervisor (Live Voice)' :
+                 'Unknown'}
               </Text>
-              <Text as="p" fontSize={turn.role === 'coach' ? 'fontSize20' : 'fontSize30'}>
+              <Text as="p" fontSize={(turn.role === 'coach' || turn.role === 'supervisor') ? 'fontSize20' : 'fontSize30'}>
                 {turn.content}
               </Text>
             </Box>
