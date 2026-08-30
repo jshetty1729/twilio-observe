@@ -1086,8 +1086,11 @@ async def observe_handback(body: ObserveBargeRequest):
     active_coaching_notes.pop(conv_id, None)  # Coaching notes now under resume_key
     voice_channel._conversations.pop(conv_id, None)
 
-    # Add placeholder event — dashboard shows a loading indicator until summary arrives
+    # Add hand-back marker + summary placeholder
     import time as _t
+    transcript_events[resume_key].append(
+        {"role": "supervisor", "content": "Supervisor left the call — handing back to AI agent.", "ts": _t.time()}
+    )
     transcript_events[resume_key].append(
         {"role": "summary", "content": "__loading__", "ts": _t.time()}
     )
